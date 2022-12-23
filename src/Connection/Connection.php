@@ -48,6 +48,15 @@ class Connection
      */
     private $session;
 
+    // BOLT Routing parameters
+    private $boltRouting = false;
+    private $boltRoutingConfig = null;
+    private $boltRoutingReadServers;
+    private $boltRoutingWriteServers;
+    private $boltRoutingLastMode = null;
+    const BOLT_ROUTING_WRITE = "WRITE";
+    const BOLT_ROUTING_READ = "READ";
+
     /**
      * Connection constructor.
      *
@@ -106,6 +115,8 @@ class Connection
      */
     public function run($statement, $parameters = null, $tag = null)
     {
+        // Check bolt-routing mode
+        $this->checkUpdateServerBoltRouting($statement);
         $this->checkSession();
         if (empty($statement)) {
             throw new \InvalidArgumentException(sprintf('Expected a non-empty Cypher statement, got "%s"', $statement));
@@ -114,6 +125,8 @@ class Connection
 
         try {
             $result = $this->session->run($statement, $parameters, $tag);
+            // Reset bolt-routing mode by default: WRITE
+            $this->checkUpdateServerBoltRouting($statement, self::BOLT_ROUTING_WRITE);
             return $result;
         } catch (MessageFailureException $e) {
             $exception = new Neo4jException($e->getMessage());
@@ -174,17 +187,85 @@ class Connection
             $port = isset($params['port']) ? (int) $params['port'] : BoltDriver::DEFAULT_TCP_PORT;
             $uri = sprintf('%s://%s:%d', $params['scheme'], $params['host'], $port);
             if (isset($params['user']) && isset($params['pass'])) {
-                $config = BoltConfiguration::create()->withCredentials($params['user'], $params['pass']);
+                $config = BoltConfiguration::create()
+                    ->withCredentials($params['user'], $params['pass'])
+                    ->withTLSMode(BoltConfiguration::TLSMODE_REQUIRED);
             } else {
                 $config = BoltConfiguration::create()->withCredentials('null', 'null');
             }
-            $this->driver = BoltGraphDB::driver($uri, $config);
+            $this->driver = BoltGraphDB::driver($uri, $config, 1);
+            // Check and setting WRITE by default
+            $this->checkInitBoltRouting($config, self::BOLT_ROUTING_WRITE);
         } elseif (preg_match('/http/', $this->uri)) {
             $uri = $this->uri;
             $this->driver = HttpGraphDB::driver($uri, $this->config);
         } else {
             throw new \RuntimeException(sprintf('Unable to build a driver from uri "%s"', $this->uri));
         }
+    }
+
+    /** 
+     * Initialize Routing Solution for Bolt
+     * @param BoltConfiguration $config
+     * @param string $forceMode - "WRITE" or "READ"
+     * @return boolean - Return true if bolt-routing is configured
+     */
+    private function checkInitBoltRouting($config, $forceMode) {
+        if (preg_match('/bolt-routing/', $this->uri) || preg_match('/bolt\+routing/', $this->uri)) {
+            $this->boltRouting = true;
+            $this->boltRoutingConfig = $config;
+            $this->checkSession();
+            $result = $this->session->run("CALL dbms.routing.getRoutingTable({})");
+            $resultServers = $result->getRecords()[0]->values()[1];
+            foreach($resultServers as $server) {
+                if ($server['role'] == self::BOLT_ROUTING_WRITE) {
+                    foreach ($server['addresses'] as $url) {
+                        $this->boltRoutingWriteServers[] = $url;
+                    }
+                } else if ($server['role'] == self::BOLT_ROUTING_READ) {
+                    foreach ($server['addresses'] as $url) {
+                        $this->boltRoutingReadServers[] = $url;
+                    }
+                }
+            }
+            if ($forceMode != null) {
+                $this->checkUpdateServerBoltRouting(null, $forceMode);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Check if server need be updated for write or read
+     * @param string $statement
+     * @param bool $forceModeWrite
+     * @return bool - Return true if server is changed
+     * 
+     */
+    private function checkUpdateServerBoltRouting($statement, $forceMode = null) {
+        if ($this->boltRouting) {
+            $mode = preg_match('/(CREATE|SET|MERGE|DELETE)/m', $statement) ? self::BOLT_ROUTING_WRITE : self::BOLT_ROUTING_READ;
+            if ($this->boltRoutingLastMode != self::BOLT_ROUTING_WRITE && ($mode === self::BOLT_ROUTING_WRITE || $forceMode == self::BOLT_ROUTING_WRITE)) {
+                $this->boltRoutingLastMode = self::BOLT_ROUTING_WRITE;
+                // Choose writer server
+                $randServer = mt_rand(0, count($this->boltRoutingWriteServers) - 1);
+                $this->driver = BoltGraphDB::driver($this->boltRoutingWriteServers[$randServer], $this->boltRoutingConfig, 1);
+                // Reset Session
+                $this->session = null;
+                return true;
+            } else if ($this->boltRoutingLastMode != self::BOLT_ROUTING_READ && ($mode === self::BOLT_ROUTING_READ || $forceMode == self::BOLT_ROUTING_READ)) {
+                $this->boltRoutingLastMode = self::BOLT_ROUTING_READ;
+                // Choose read server
+                $randServer = mt_rand(0, count($this->boltRoutingReadServers) - 1);
+                $this->driver = BoltGraphDB::driver($this->boltRoutingReadServers[$randServer], $this->boltRoutingConfig, 1);
+                // Reset Session
+                $this->session = null;
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function checkSession()

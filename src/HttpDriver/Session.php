@@ -267,8 +267,9 @@ class Session implements SessionInterface
     {
         $statements = [];
         foreach ($statementsStack as $statement) {
+            $neo4j_v4fixed = preg_replace("/(\{)(\S*)}/", "\$$2", $statement->text());
             $st = [
-                'statement' => $statement->text(),
+                'statement' => $neo4j_v4fixed,
                 'resultDataContents' => ['REST', 'GRAPH'],
                 'includeStats' => true,
             ];
